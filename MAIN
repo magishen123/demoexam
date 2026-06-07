@@ -50,7 +50,7 @@ nano /etc/nftables/isp.nft
 	table inet nat {
 		chain POSTROUTING {
 		type nat hook postrouting priority srcnat;
-		oifname "ens18_ПОРТ" masquerade
+		oifname "ens18_ПОРТ_ИНЕТ" masquerade
 		}
 	}
 
