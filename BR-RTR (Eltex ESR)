@@ -1,0 +1,121 @@
+```
+configure
+
+hostname br-rtr.sirius-exam.org
+
+username net_admin
+password P@ssw0rd
+privilege 15
+exit
+
+domain lookup enable
+domain nameserver 192.168.100.2
+domain nameserver 77.88.8.7
+domain name sirius-exam.org
+security passwords default-expired
+ip ssh server
+ntp enable
+ntp broadcast-client enable
+
+interface gigabitethernet 1/0/3
+ip firewall disable
+ip address 172.16.2.2/28
+exit
+
+interface gigabitethernet 1/0/2
+ip firewall disable
+ip address 192.168.30.1/28
+exit
+
+key-chain auth_ospf
+key 1
+key-string ascii-text P@ssw0rd
+exit
+exit
+
+tunnel gre 1
+ttl 64
+local address 172.16.2.2
+remote address 172.16.1.2
+ip address 10.10.10.2/30
+ip firewall disable
+ip ospf instance 1
+ip ospf authentication key-chain auth_ospf
+ip ospf authentication algorithm md5
+ip ospf
+enable
+exit
+
+router ospf 1
+router-id 2.2.2.2
+area 0.0.0.0
+network 192.168.30.0/28
+enable
+exit
+enable
+
+object-group network LOCAL_NET
+ip address-range 192.168.30.2-192.168.30.14
+exit
+object-group network PUBLIC_POOL
+ip address-range 172.16.2.3-172.16.2.7
+exit
+
+interface gigabitethernet 1/0/3
+ip nat proxy-arp PUBLIC_POOL
+exit
+
+nat source
+pool TRANSLATE_ADDRESS
+ip address-range 172.16.2.3-172.16.2.7
+exit
+ruleset SNAT
+to interface gigabitethernet 1/0/3
+rule 1
+match source-address object-group network LOCAL_NET
+action source-nat pool TRANSLATE_ADDRESS
+enable
+exit
+exit
+exit
+
+object-group service HTTP_PORT
+port-range 8080
+exit
+object-group service SSH_PORT
+port-range 2026
+exit
+
+nat destination
+pool BR_WEB_POOL
+ip address 192.168.30.2
+ip port 8080
+exit
+pool BR_SSH_POOL
+ip address 192.168.30.2
+ip port 2026
+exit
+ruleset DNAT
+from default
+rule 10
+match destination-address address-range 172.16.2.2
+match protocol tcp
+match destination-port object-group HTTP_PORT
+action destination-nat pool BR_WEB_POOL
+enable
+exit
+rule 20
+match destination-address address-range 172.16.2.2
+match protocol tcp
+match destination-port object-group SSH_PORT
+action destination-nat pool BR_SSH_POOL
+enable
+exit
+exit
+exit
+
+ip route 0.0.0.0/0 172.16.2.1 200
+
+commit
+confirm
+```
