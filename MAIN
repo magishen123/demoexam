@@ -1,0 +1,515 @@
+
+```
+==================================ОБЩЕЕ==================================
+# ИМЯ - ТАБЛИЦА!
+hostnamectl set-hostname isp.sirius-exam.org; exec bash 
+(# isp/hq-srv/hq-cli/br-srv .sirius-exam.org)
+
+# ИНТЕРНЕТ
+nmtui
+ip firewall disable
+sysctl net.ipv4.ip_forward=1 >> /etc/sysctl.conf
+sysctl -p
+
+# ПРОВЕРКА 
+ip -c -br a
+
+sudo nano /etc/selinux/config
+SELINUX=disabled
+setenforce 0
+getenforce - проверка что отключен 
+
+# ВРЕМЯ
+timedatectl set-timezone Europe/Moscow 
+
+# DNS (потом исправить )
+sudo nano /etc/systemd/resolved.conf
+	[Resolve]
+	DNS=192.168.100.2 77.88.8.7
+	FallbackDNS=77.88.8.3
+	Domains=sirius-exam.org
+
+systemctl restart systemd-resolved
+
+===============================ISP======================================
+# УСТАНОВКА 
+dnf install -y nftables nginx httpd-tools chrony
+
+--------ПРОБРОС ПОРТОВ/ИНТЕРНЕТ/DNS
+nano /etc/rc.d/rc.local
+	ip route add 192.168.100.0/27 via 172.16.1.2 (BR)
+	ip route add 192.168.200.0/28 via 172.16.1.2 (BR)
+	ip route add 192.168.30.0/28 via 172.16.2.2 (HQ)
+	
+chmod +x /etc/rc.d/rc.local
+nmcli connection up ens19 && nmcli connection up ens20 (на всякий)
+
+
+# NFTABLES
+nano /etc/nftables/isp.nft
+	table inet nat {
+		chain POSTROUTING {
+		type nat hook postrouting priority srcnat;
+		oifname "ens18_ПОРТ" masquerade
+		}
+	}
+
+
+nano /etc/sysconfig/nftables.conf
+	include "/etc/nftables/isp.nft"
+
+systemctl enable --now nftables && systemctl restart nftables
+
+# ПРОВЕРКА
+sudo nft list ruleset
+ping ya.ru
+
+
+---------УЧЕТКА 
+
+useradd net_admin
+echo 'net_admin:P@ssw0rd' | chpasswd 
+usermod -aG wheel net_admin
+
+nano /etc/sudoers.d/net_admin
+	net_admin ALL=(ALL) NOPASSWD: ALL
+
+chmod 440 /etc/sudoers.d/net_admin
+
+----------CHRONY
+nano /etc/chrony.conf
+	server ntp1.vniiftri.ru iburst prefer
+	local stratum 5
+	allow 0.0.0.0/0
+	driftfile /var/lib/chrony/drift
+	makestep 1.0 3
+	rtcsync
+	logdir /var/log/chrony
+
+systemctl enable --now chronyd && systemctl restart chronyd
+
+--------Nginx reverse proxy
+nano /etc/nginx/conf.d/web.conf
+	server {
+	    listen 80;
+	    server_name web.sirius-exam.org;
+	    location / {
+	        proxy_pass http://172.16.1.2:8080;
+	        proxy_set_header Host $host;
+	        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+	        proxy_set_header X-Real-IP $remote_addr;
+	        auth_basic "Restricted area";
+	        auth_basic_user_file /etc/nginx/.htpasswd;
+	    }
+}
+
+nano /etc/nginx/conf.d/docker.conf
+	server {
+	    listen 80;
+	    server_name docker.sirius-exam.org;
+	    location / {
+	        proxy_pass http://172.16.2.2:8080;
+	        proxy_set_header Host $host;
+	        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+	        proxy_set_header X-Real-IP $remote_addr;
+	    }
+}
+
+SSL для Nextcloud:
+mkdir -p /etc/nginx/ssl
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/nginx/ssl/nextcloud.key -out /etc/nginx/ssl/nextcloud.crt -subj "/C=RU/ST=Moscow/L=Moscow/O=Sirius/OU=IT/CN=nextcloud.sirius-exam.org"
+
+nano /etc/nginx/conf.d/nextcloud.conf
+	server {
+	    listen 443 ssl http2;
+	    server_name nextcloud.sirius-exam.org;
+	    ssl_certificate /etc/nginx/ssl/nextcloud.crt;
+	    ssl_certificate_key /etc/nginx/ssl/nextcloud.key;
+	    client_max_body_size 512M;
+	    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+	    location / {
+	        proxy_pass http://172.16.2.2:8081;
+	        proxy_set_header Host $host;
+	        proxy_set_header X-Real-IP $remote_addr;
+	        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+	        proxy_set_header X-Forwarded-Proto $scheme;
+	        proxy_buffering off;
+	        proxy_request_buffering off;
+	    }
+}
+
+--------htpasswd + запуск
+echo 'P@ssw0rd' | htpasswd -i -c /etc/nginx/.htpasswd WEB
+nginx -t
+systemctl enable --now nginx
+systemctl restart nginx
+
+================================HQ-SRV==================================
+# УСТАНОВКА
+dnf install -y bind bind-utils chrony mdadm nfs-utils nfs4-acl-tools httpd php php-mysqlnd mariadb-server mariadb
+
+----------УЧЕТКИ
+useradd -u 2026 sshuser
+usermod -aG wheel sshuser
+echo 'sshuser:P@ssw0rd' | chpasswd
+echo 'sshuser ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/sshuser
+chmod 440 /etc/sudoers.d/sshuser
+
+# SSH 
+nano /etc/ssh/sshd_config
+	Port 2026 
+	MaxAuthTries 2 
+	AllowUsers sshuser 
+	PasswordAuthentication yes 
+	Banner /etc/ssh/banner
+
+echo 'Authorized access only' > /etc/ssh/banner
+systemctl restart sshd
+semanage port -a -t ssh_port_t -p tcp 2026
+systemctl restart sshd
+
+------Chrony (клиент)
+nano /etc/chrony.conf
+	server 172.16.1.1 
+	iburst driftfile /var/lib/chrony/drift 
+	makestep 1.0 3 
+	rtcsync 
+	logdir /var/log/chrony
+
+systemctl enable --now chronyd` `systemctl restart chronyd
+
+---------DNS
+nano /etc/named.conf
+
+options {
+	listen-on port 53 { any; };
+	listen-on-v6 port 53 { none; };
+	directory "/var/named";
+	dump-file "/var/named/data/cache_dump.db";
+	statistics-file "/var/named/data/named_stats.txt";
+	memstatistics-file "/var/named/data/named_mem_stats.txt";
+	secroots-file "/var/named/data/named.secroots";
+	recursing-file "/var/named/data/named.recursing";
+	allow-query { any; };
+	recursion yes;
+	dnssec-validation no;
+	forward first;
+	forwarders { 77.88.8.7; };
+	managed-keys-directory "/var/named/dynamic";
+	pid-file "/run/named/named.pid";
+	session-keyfile "/run/named/session.key";
+};
+logging { channel default_debug { file "data/named.run"; severity dynamic; }; };
+zone "." IN { type hint; file "named.ca"; };
+zone "sirius-exam.org" { type master; file "master/sirius-exam.org"; };
+zone "100.168.192.in-addr.arpa" { type master; file "master/100.168.192.in-addr.arpa"; };
+zone "200.168.192.in-addr.arpa" { type master; file "master/200.168.192.in-addr.arpa"; };
+zone "30.168.192.in-addr.arpa" { type master; file "master/30.168.192.in-addr.arpa"; };
+include "/etc/named.rfc1912.zones";
+include "/etc/named.root.key";
+
+
+# Проверка 
+named-checkconf
+
+
+# ДИРЕКТОРИЯ ДЛЯ ЗОН
+mkdir -p /var/named/master
+chown root:named /var/named/master
+chmod 750 /var/named/master
+
+
+# Создание зон 
+nano /var/named/master/sirius-exam.org
+$TTL 604800
+sirius-exam.org. IN SOA ns01.sirius-exam.org. root.sirius-exam.org. (2026052801 600 3600 1w 360)
+        IN NS ns01.sirius-exam.org.
+ns01    IN A  192.168.100.2
+hq-srv  IN A  192.168.100.2
+hq-rtr  IN A  192.168.100.1
+hq-cli  IN A  192.168.200.2
+br-srv  IN A  192.168.30.2
+br-rtr  IN A  192.168.30.1
+isp     IN A  172.16.1.1
+web     IN CNAME isp.sirius-exam.org.
+docker  IN CNAME isp.sirius-exam.org.
+
+-----
+nano /var/named/master/100.168.192.in-addr.arpa
+$TTL 604800
+100.168.192.in-addr.arpa. IN SOA ns01.sirius-exam.org. root.sirius-exam.org. (2026052801 600 3600 1w 360)
+        IN NS ns01.sirius-exam.org.
+2       IN PTR hq-srv.sirius-exam.org.
+1       IN PTR hq-rtr.sirius-exam.org.
+
+-----
+nano /var/named/master/200.168.192.in-addr.arpa
+$TTL 604800
+200.168.192.in-addr.arpa. IN SOA ns01.sirius-exam.org. root.sirius-exam.org. (2026052801 600 3600 1w 360)
+        IN NS ns01.sirius-exam.org.
+2       IN PTR hq-cli.sirius-exam.org.
+1       IN PTR hq-rtr.sirius-exam.org.
+
+--------
+nano /var/named/master/30.168.192.in-addr.arpa
+$TTL 604800
+30.168.192.in-addr.arpa. IN SOA ns01.sirius-exam.org. root.sirius-exam.org. (2026052801 600 3600 1w 360)
+        IN NS ns01.sirius-exam.org.
+2       IN PTR br-srv.sirius-exam.org.
+1       IN PTR br-rtr.sirius-exam.org.
+
+----
+chown root:named /var/named/master/* && chmod 640 /var/named/master/*
+systemctl enable --now named && systemctl restart named
+
+После запуска BIND — перенастроить resolved на HQ-SRV
+nano /etc/systemd/resolved.conf.d/dns.conf
+	[Resolve]
+	DNS=127.0.0.1
+	FallbackDNS=77.88.8.7
+	Domains=sirius-exam.org
+	
+systemctl restart systemd-resolved
+
+Прописать в DNS свой же адрес 
+BR-SRV прописать в DNS HQ-SRV 
+
+# Проверка
+named-checkconf –z
+ping au-team.irpo
+host hq-rtr.au-team.irpo
+host 192.168.100.1
+
+--------RAID 0
+Определить диски: lsblk (sdb+sdc или vdb+vdc)
+mdadm --create /dev/md0 --level=0 --raid-devices=2 /dev/sdb /dev/sdc --run
+mdadm --detail --scan >> /etc/mdadm.conf
+mkfs.ext4 /dev/md0
+mkdir -p /raid
+mount /dev/md0 /raid
+echo '/dev/md0  /raid  ext4  defaults  0  2' >> /etc/fstab
+
+--------NFS-сервер
+mkdir -p /raid/nfs
+chmod 777 /raid/nfs
+
+nano /etc/exports
+	/raid/nfs       192.168.200.0/28(rw,no_root_squash)
+
+systemctl enable --now nfs-server && systemctl restart nfs-server && exportfs -arv
+
+--------Apache + MariaDB (веб-приложение)
+
+mkdir -p /mnt/cdrom
+mount -o ro /dev/sr0 /mnt/cdrom
+cp -r /mnt/cdrom/web/ /home/user/web/
+
+systemctl enable --now mariadb
+mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY 'P@ssw0rd';"
+mysql -u root -pP@ssw0rd -e "DELETE FROM mysql.user WHERE User=''; DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost','127.0.0.1','::1'); DROP DATABASE IF EXISTS test; FLUSH PRIVILEGES;"
+mysql -u root -pP@ssw0rd -e "CREATE DATABASE IF NOT EXISTS webdb; CREATE USER IF NOT EXISTS 'web'@'%' IDENTIFIED BY 'P@ssw0rd'; GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'%'; FLUSH PRIVILEGES;"
+mysql -u root -pP@ssw0rd webdb < /home/user/web/dump.sql
+
+cp /home/user/web/index.php /home/user/web/logo.png /var/www/html/
+chown -R apache:apache /var/www/html/
+
+
+
+Отредактировать `nano /var/www/html/index.php` — найти и заменить параметры подключения к БД:
+
+$servername = "localhost";
+$username = "web";
+$password = "P@ssw0rd";
+$dbname = "webdb";
+
+systemctl enable --now httpd && systemctl restart httpd
+
+=================================BR-SRV=================================
+# УСТАНОВКА 
+dnf install -y chrony docker-ce docker-ce-cli docker-compose-plugin docker-compose samba nginx openssl
+
+----------УЧЕТКИ
+useradd -u 2026 sshuser
+usermod -aG wheel sshuser
+echo 'sshuser:P@ssw0rd' | chpasswd
+echo 'sshuser ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/sshuser
+chmod 440 /etc/sudoers.d/sshuser
+
+# SSH 
+nano /etc/ssh/sshd_config
+	Port 2026 
+	MaxAuthTries 2 
+	AllowUsers sshuser 
+	PasswordAuthentication yes 
+	Banner /etc/ssh/banner
+
+echo 'Authorized access only' > /etc/ssh/banner
+systemctl restart sshd
+semanage port -a -t ssh_port_t -p tcp 2026
+systemctl restart sshd
+
+------Chrony (клиент)
+nano /etc/chrony.conf
+	server 172.16.1.1 
+	iburst driftfile /var/lib/chrony/drift 
+	makestep 1.0 3 
+	rtcsync 
+	logdir /var/log/chrony
+
+systemctl enable --now chronyd` `systemctl restart chronyd
+
+
+-------Монтирование CD
+mkdir -p /mnt/cdrom
+mount -o ro /dev/sr0 /mnt/cdrom
+cp -r /mnt/cdrom/docker/ /home/user/docker/
+
+
+-----SAMBA
+groupadd hq
+useradd -G hq hquser1
+echo -e "P@ssw0rd\nP@ssw0rd" | smbpasswd -a -s hquser1
+useradd -G hq hquser2
+echo -e "P@ssw0rd\nP@ssw0rd" | smbpasswd -a -s hquser2
+useradd -G hq hquser3
+echo -e "P@ssw0rd\nP@ssw0rd" | smbpasswd -a -s hquser3
+useradd -G hq hquser4
+echo -e "P@ssw0rd\nP@ssw0rd" | smbpasswd -a -s hquser4
+useradd -G hq hquser5
+echo -e "P@ssw0rd\nP@ssw0rd" | smbpasswd -a -s hquser5
+
+nano /etc/samba/smb.conf
+	[global]
+	  workgroup = SIRIUSEXAM
+	  server string = BR-SRV Samba Server
+	  netbios name = BR-SRV
+	  security = user
+	  map to guest = Bad User
+	  dns proxy = no
+	  realm = SIRIUS-EXAM.ORG	  
+
+systemctl enable --now smb nmb && systemctl restart smb nmb
+
+
+-----Docker — загрузка образов
+systemctl enable --now docker
+docker load < /home/user/docker/site_latest.tar
+docker load < /home/user/docker/mariadb_latest.tar
+
+
+# Docker — Testapp
+nano /root/web.yaml - (отдлеьный файл)
+
+cd /root && docker-compose -f web.yaml up -d
+# Подождать ~30 сек, затем:
+docker exec db mysql -u root -pP@ssw0rd -e "CREATE DATABASE IF NOT EXISTS testdb; CREATE USER IF NOT EXISTS 'test'@'%' IDENTIFIED BY 'P@ssw0rd'; GRANT ALL PRIVILEGES ON testdb.* TO 'test'@'%'; FLUSH PRIVILEGES;" 
+docker-compose -f web.yaml restart
+
+
+
+# Docker — Nextcloud
+mkdir -p /opt/nextcloud/db_data /opt/nextcloud/nextcloud_data
+
+nano /opt/nextcloud/docker-compose.yml (Отдельный файл)
+
+cd /opt/nextcloud
+docker-compose up -d
+
+
+--------Nginx + SSL на BR-SRV (для Nextcloud)
+mkdir -p /etc/nginx/ssl /etc/nginx/sites-available /etc/nginx/sites-enabled
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/nginx/ssl/nextcloud.key -out /etc/nginx/ssl/nextcloud.crt -subj "/C=RU/ST=Moscow/L=Moscow/O=Sirius/OU=IT/CN=127.0.0.1"
+
+
+nano /etc/nginx/sites-available/nextcloud.conf
+server {
+    listen 443 ssl http2;
+    server_name 127.0.0.1;
+    ssl_certificate /etc/nginx/ssl/nextcloud.crt;
+    ssl_certificate_key /etc/nginx/ssl/nextcloud.key;
+    client_max_body_size 512M;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+    location / {
+        proxy_pass http://127.0.0.1:8081;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }
+}
+
+ln -sf /etc/nginx/sites-available/nextcloud.conf /etc/nginx/sites-enabled/nextcloud.conf
+
+В /etc/nginx/nginx.conf добавить в блок http: include /etc/nginx/sites-enabled/*.conf;
+
+rm -f /etc/nginx/conf.d/default.conf
+nginx -t && systemctl enable --now nginx && systemctl restart nginx
+
+
+=================================HQ-CLI=================================
+CLI - не трогай у него DHCP 
+
+# УСТАНОВКА
+dnf install -y chrony nfs-utils samba-client
+
+----------УЧЕТКИ
+useradd -u 2026 sshuser
+usermod -aG wheel sshuser
+echo 'sshuser:P@ssw0rd' | chpasswd
+echo 'sshuser ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/sshuser
+chmod 440 /etc/sudoers.d/sshuser
+
+# SSH 
+nano /etc/ssh/sshd_config
+	Port 2026 
+	MaxAuthTries 2 
+	AllowUsers sshuser 
+	PasswordAuthentication yes 
+	Banner /etc/ssh/banner
+
+echo 'Authorized access only' > /etc/ssh/banner
+systemctl restart sshd
+semanage port -a -t ssh_port_t -p tcp 2026
+systemctl restart sshd
+
+------Chrony (клиент)
+nano /etc/chrony.conf
+	server 172.16.1.1 
+	iburst driftfile /var/lib/chrony/drift 
+	makestep 1.0 3 
+	rtcsync 
+	logdir /var/log/chrony
+
+systemctl enable --now chronyd` `systemctl restart chronyd
+
+
+-------NFS-КЛИЕНТ
+mkdir -p /mnt/nfs && chmod 777 /mnt/nfs
+echo '192.168.100.2:/raid/nfs  /mnt/nfs  nfs  auto  0 0' >> /etc/fstab
+mount -a
+
+
+-------Пользователи и группы (Мод2)
+groupadd Work
+groupadd Job
+groupadd labor
+useradd -G Work User1
+useradd -G Work User2
+useradd -G Job User3
+useradd -G Job User4
+useradd -G labor User5
+mkdir -p /home/Folder
+mkdir /home/Folder/work_shared
+chown root:Work /home/Folder/work_shared
+chmod 770 /home/Folder/work_shared
+mkdir /home/Folder/job_readonly
+chown root:Job /home/Folder/job_readonly
+chmod 750 /home/Folder/job_readonly
+
+```
+
+### Ошибки 
+1. semanage: команда не найдена
+	**dnf install policycoreutils-python -y**
